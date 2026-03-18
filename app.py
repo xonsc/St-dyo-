@@ -47,7 +47,7 @@ def gemini_request(url, payload, retries=3):
 
 
 def analyze_and_generate_prompt(image_base64, mime_type):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [
             {"inline_data": {"mime_type": mime_type, "data": image_base64}},
