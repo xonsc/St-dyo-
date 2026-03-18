@@ -79,18 +79,175 @@ def upload_to_canva(image_b64, filename):
         "Content-Type": "application/octet-stream",
         "Asset-Upload-Metadata": json.dumps({"name": filename, "mime_type": "image/jpeg"})
     }
-    response = requests.post("https://api.canva.com/rest/v1/asset-uploads", headers=headers, data=image_data, timeout=60)
+    response = requests.post(
+        "https://api.canva.com/rest/v1/asset-uploads",
+        headers=headers,
+        data=image_data,
+        timeout=60
+    )
     response.raise_for_status()
     job_id = response.json()["job"]["id"]
 
     for _ in range(30):
         time.sleep(2)
-        status = requests.get(f"https://api.canva.com/rest/v1/asset-uploads/{job_id}", headers={"Authorization": f"Bearer {CANVA_API_KEY}"}, timeout=30).json()
+        status = requests.get(
+            f"https://api.canva.com/rest/v1/asset-uploads/{job_id}",
+            headers={"Authorization": f"Bearer {CANVA_API_KEY}"},
+            timeout=30
+        ).json()
         if status["job"]["status"] == "success":
             return status["job"]["asset"]["id"]
         elif status["job"]["status"] == "failed":
             raise Exception("Canva upload basarisiz")
     raise Exception("Canva upload timeout")
+
+
+def find_first_empty_page_element_id():
+    """
+    Canva'daki ilk bos sayfayi bul.
+    Bos sayfa = richtexts icinde 'Urun ve Fiyat' yazan sayfa.
+    O sayfanin page_id'sini ve element_id'sini dondur.
+    """
+    headers = {
+        "Authorization": f"Bearer {CANVA_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # Editing transaction ac - fills ve richtexts gelecek
+    tx_response = requests.post(
+        f"https://api.canva.com/rest/v1/designs/{CANVA_DESIGN_ID}/editing-sessions",
+        headers=headers,
+        timeout=30
+    )
+    tx_response.raise_for_status()
+    tx_data = tx_response.json()
+    session_id = tx_data["editing_session"]["id"]
+
+    # Design icerigini getir
+    content_response = requests.get(
+        f"https://api.canva.com/rest/v1/designs/{CANVA_DESIGN_ID}?content_types=richtexts",
+        headers=headers,
+        timeout=30
+    )
+
+    # Transaction'i iptal et (sadece okuma yaptik)
+    requests.post(
+        f"https://api.canva.com/rest/v1/designs/{CANVA_DESIGN_ID}/editing-sessions/{session_id}/cancel",
+        headers=headers,
+        timeout=15
+    )
+
+    return session_id  # Buradan devam etmeyecegiz, asagida farkli yontem kullaniyoruz
+
+
+def add_image_to_empty_page(asset_id):
+    """
+    Canva editing API ile bos sayfaya gorseli yukle.
+    - Yeni transaction ac
+    - 'Urun ve Fiyat' yazan sayfayi bul (richtexts'ten)
+    - O sayfanin fill element_id'sine update_fill uygula
+    - Commit et
+    """
+    headers = {
+        "Authorization": f"Bearer {CANVA_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # 1. Editing transaction ac
+    tx_response = requests.post(
+        f"https://api.canva.com/rest/v1/designs/{CANVA_DESIGN_ID}/editing-sessions",
+        headers=headers,
+        timeout=30
+    )
+    tx_response.raise_for_status()
+    tx_data = tx_response.json()
+    session_id = tx_data["editing_session"]["id"]
+
+    richtexts = tx_data.get("richtexts", [])
+    fills = tx_data.get("fills", [])
+    pages = tx_data.get("pages", [])
+
+    # 2. 'Urun ve Fiyat' yazan sayfayi bul
+    target_page_index = None
+    for item in richtexts:
+        regions = item.get("regions", [])
+        for region in regions:
+            if "Fiyat" in region.get("text", ""):
+                target_page_index = item.get("page_index")
+                break
+        if target_page_index:
+            break
+
+    if not target_page_index:
+        # Fallback: fills olmayan ilk sayfayi bul
+        filled_pages = {f["page_index"] for f in fills}
+        for page in pages:
+            if page["page_number"] not in filled_pages:
+                target_page_index = page["page_number"]
+                break
+
+    if not target_page_index:
+        # Son fallback: son sayfa
+        target_page_index = pages[-1]["page_number"] if pages else 9
+
+    print(f"Hedef sayfa: {target_page_index}")
+
+    # 3. O sayfanin fill element_id'sini bul
+    target_element_id = None
+    for fill in fills:
+        if fill.get("page_index") == target_page_index and fill.get("editable"):
+            target_element_id = fill.get("element_id")
+            break
+
+    # 4. Element bulunduysa update_fill, bulunamadiysa insert_fill
+    if target_element_id:
+        operation = {
+            "type": "update_fill",
+            "element_id": target_element_id,
+            "asset_type": "image",
+            "asset_id": asset_id,
+            "alt_text": "Studio product photo"
+        }
+        print(f"update_fill kullaniliyor: {target_element_id}")
+    else:
+        # Sayfanin page_id'sini bul
+        target_page_id = None
+        for page in pages:
+            if page["page_number"] == target_page_index:
+                target_page_id = page["page_id"]
+                break
+
+        operation = {
+            "type": "insert_fill",
+            "page_id": target_page_id,
+            "asset_type": "image",
+            "asset_id": asset_id,
+            "alt_text": "Studio product photo",
+            "top": 0,
+            "left": 0,
+            "width": 1080,
+            "height": 1920
+        }
+        print(f"insert_fill kullaniliyor: {target_page_id}")
+
+    # 5. Operasyonu uygula
+    edit_response = requests.post(
+        f"https://api.canva.com/rest/v1/designs/{CANVA_DESIGN_ID}/editing-sessions/{session_id}/changes",
+        headers=headers,
+        json={"changes": [operation], "page_index": target_page_index},
+        timeout=30
+    )
+    print(f"Edit response: {edit_response.status_code} - {edit_response.text[:200]}")
+
+    # 6. Commit et
+    commit_response = requests.post(
+        f"https://api.canva.com/rest/v1/designs/{CANVA_DESIGN_ID}/editing-sessions/{session_id}/publish",
+        headers=headers,
+        timeout=30
+    )
+    print(f"Commit response: {commit_response.status_code}")
+
+    return target_page_index
 
 
 @app.route("/")
@@ -111,27 +268,34 @@ def process():
 
         print("Prompt uretiliyor...")
         prompt = analyze_and_generate_prompt(image_b64, mime_type)
-        print(f"Prompt: {prompt[:80]}...")
+        print(f"Prompt hazir: {prompt[:80]}...")
 
         print("Studio gorseli uretiliyor...")
         studio_image_b64 = generate_studio_image(prompt)
-        print("Gorsel uretildi!")
+        print("Gorsel hazir!")
 
         print("Canvaya yukleniyor...")
         filename = f"studio_{int(time.time())}.jpg"
         asset_id = upload_to_canva(studio_image_b64, filename)
         print(f"Asset ID: {asset_id}")
 
+        print("Sayfaya ekleniyor...")
+        page_index = add_image_to_empty_page(asset_id)
+        print(f"Sayfa {page_index}'e eklendi!")
+
         return jsonify({
             "success": True,
             "prompt": prompt,
             "asset_id": asset_id,
+            "page_index": page_index,
             "studio_image": f"data:image/jpeg;base64,{studio_image_b64}",
-            "message": "Gorsel Canvaya yuklendi!"
+            "message": f"Gorsel Canva sayfa {page_index}'e yuklendi!"
         })
 
     except Exception as e:
         print(f"Hata: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
